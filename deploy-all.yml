@@ -1,0 +1,143 @@
+name: Deploy All (Backend + Mobile + Slack + PagerDuty + Release)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AWS_REGION: us-east-1
+      GHCR_REPO: ghcr.io/${{ github.repository_owner }}/passive-income-backend
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Extract version info
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Determine environment
+        id: envdetect
+        run: |
+          if [[ "${{ steps.vars.outputs.tag }}" == *"-rc"* || "${{ steps.vars.outputs.tag }}" == *"beta"* ]]; then
+            echo "env=staging" >> $GITHUB_OUTPUT
+            echo "slack_channel=#deploy-staging" >> $GITHUB_OUTPUT
+            echo "grafana_url=https://grafana.passiveai-staging.com/d/staging-overview" >> $GITHUB_OUTPUT
+          else
+            echo "env=prod" >> $GITHUB_OUTPUT
+            echo "slack_channel=#deploy-prod" >> $GITHUB_OUTPUT
+            echo "grafana_url=https://grafana.passiveai.com/d/prod-overview" >> $GITHUB_OUTPUT
+          fi
+
+      # -------------------------
+      # Build & Deploy Backend
+      # -------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ env.GHCR_REPO }}:${{ steps.vars.outputs.sha_short }}
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name passive-income-ai-eks --region $AWS_REGION
+
+      - name: Deploy backend to EKS
+        run: |
+          sed -i "s|REPO_OWNER|${{ github.repository_owner }}|g" k8s/overlays/prod/backend-deployment-patch.yaml || true
+          sed -i "s|PROD_TAG|${{ steps.vars.outputs.sha_short }}|g" k8s/overlays/prod/backend-deployment-patch.yaml || true
+          kustomize build k8s/overlays/prod | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/backend -n app --timeout=300s
+
+      # -------------------------
+      # Expo Mobile Builds
+      # -------------------------
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Expo CLI
+        run: npm install -g expo-cli eas-cli
+
+      - name: Install mobile dependencies
+        working-directory: ./mobile
+        run: npm install
+
+      - name: Start Expo EAS builds (iOS + Android)
+        id: eas
+        working-directory: ./mobile
+        env:
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
+        run: |
+          echo "Starting EAS builds..."
+          npx eas build --platform ios --profile production --non-interactive --token $EAS_TOKEN > ios.log 2>&1 &
+          npx eas build --platform android --profile production --non-interactive --token $EAS_TOKEN > android.log 2>&1 &
+          wait
+
+      # -------------------------
+      # Slack + PagerDuty + Release
+      # -------------------------
+      - name: Slack notification (start)
+        id: slack_start
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          CHANNEL=$(echo "${{ steps.envdetect.outputs.slack_channel }}" | sed 's/#//')
+          MSG="🚀 *${{ steps.envdetect.outputs.env }} Deploy Started*\\nTag: ${{ steps.vars.outputs.tag }} | SHA: ${{ steps.vars.outputs.sha_short }}"
+          RESP=$(curl -s -X POST 'https://slack.com/api/chat.postMessage' \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data "{\"channel\":\"$CHANNEL\",\"text\":\"$MSG\"}")
+          TS=$(echo "$RESP" | jq -r '.ts')
+          echo "ts=$TS" >> $GITHUB_OUTPUT
+
+      - name: Send silent PagerDuty change event
+        run: |
+          curl -X POST 'https://events.pagerduty.com/v2/change/enqueue' \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "routing_key": "'${{ secrets.PAGERDUTY_ROUTING_KEY }}'",
+            "payload": {
+              "summary": "Passive Income AI deploy '${{ steps.vars.outputs.tag }}'",
+              "source": "GitHub Actions",
+              "custom_details": {
+                "sha": "'${{ steps.vars.outputs.sha_short }}'",
+                "env": "'${{ steps.envdetect.outputs.env }}'"
+              }
+            }
+          }'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Release ${{ steps.vars.outputs.tag }}
+          body: |
+            🚀 *USADI Release*  
+            SHA: `${{ steps.vars.outputs.sha_short }}`  
+            Grafana Dashboard: [${{ steps.envdetect.outputs.env }}](${{ steps.envdetect.outputs.grafana_url }})
